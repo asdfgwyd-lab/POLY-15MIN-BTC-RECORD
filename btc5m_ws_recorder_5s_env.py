@@ -27,7 +27,7 @@ import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
 import websockets
@@ -143,7 +143,7 @@ def gamma_list_markets(
 
 def gamma_get_market_by_slug(slug: str, timeout_read: int) -> Optional[dict]:
     try:
-        r = SESSION.get(f"{GAMMA_BASE}/markets/slug/{slug}", timeout=(10, timeout_read))
+        r = SESSION.get(f"{GAMMA_BASE}/markets/slug/{slug}", timeout=(5, timeout_read))
         r.raise_for_status()
         data = r.json()
         return data if isinstance(data, dict) else None
@@ -175,7 +175,12 @@ def extract_yes_no_tokens(m: dict) -> Optional[Tuple[str, str]]:
     # Fallback: first two as YES/NO (works if outcomes are UP/DOWN too; we still label as YES/NO in output)
     return toks[0], toks[1]
 
-def discover_btc5m_markets(now_ts: int, lookahead_hours: int, timeout_read: int) -> List[MarketInfo]:
+def discover_btc5m_markets(
+    now_ts: int,
+    lookahead_hours: int,
+    timeout_read: int,
+    heartbeat_cb: Optional[Callable[[], None]] = None,
+) -> List[MarketInfo]:
     """
     Real-time window strategy:
     - Construct slugs by 5m grid around now (start_ts in seconds).
@@ -198,6 +203,8 @@ def discover_btc5m_markets(now_ts: int, lookahead_hours: int, timeout_read: int)
     end_ts = floor_to_grid(now_ts + lookahead_hours * 3600, step)
 
     for ts in range(start_ts, end_ts + 1, step):
+        if heartbeat_cb:
+            heartbeat_cb()
         slug = f"{SLUG_PREFIX}{ts}"
         stats["slugs"] += 1
 
@@ -451,6 +458,7 @@ class Recorder:
                                 now_ts=now,
                                 lookahead_hours=self.lookahead_hours,
                                 timeout_read=self.gamma_timeout_read,
+                                heartbeat_cb=lambda: self._notify_watchdog(time.time()),
                             )
                             new_active = self.compute_active_tokens(markets, now_ts=now)
                             tokens_changed = new_active != self.active_tokens
@@ -512,6 +520,14 @@ def main():
     # log line interval (seconds). 60 means "about once a minute"
     log_every_sec = int(os.getenv("LOG_EVERY_SEC", "60"))
     watchdog_ping_sec = int(os.getenv("WATCHDOG_PING_SEC", "10"))
+    watchdog_usec = int(os.getenv("WATCHDOG_USEC", "0") or "0")
+
+    # When running under systemd watchdog, keep ping cadence and blocking HTTP timeout conservative.
+    if watchdog_usec > 0:
+        watchdog_sec = max(1, watchdog_usec // 1_000_000)
+        auto_ping = max(1, watchdog_sec // 3)
+        watchdog_ping_sec = min(watchdog_ping_sec, auto_ping) if watchdog_ping_sec > 0 else auto_ping
+        gamma_timeout_read = min(gamma_timeout_read, max(1, watchdog_ping_sec - 1))
 
     if sample_sec <= 0:
         raise ValueError("SAMPLE_SEC must be > 0")
